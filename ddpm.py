@@ -7,8 +7,9 @@ batch_size = 64 # # independent sequences will we process in parallel
 block_size = 256 # maximum context length for predictions
 max_iters = 5000
 eval_interval = 500
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 learning_rate = 3e-4
-eval_inters = 200
+eval_iters = 200
 n_embd = 384
 n_head = 6
 n_layer = 6
@@ -19,7 +20,6 @@ torch.manual_seed(1337)
 
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
-
 
 # tokenization
 chars = sorted(list(set(text)))
@@ -57,38 +57,59 @@ def estimate_loss():
     out[split] = losses.mean()
   model.train()
   return out
-class MultiHeadAttention(nn.Module):
-  """ multiple heads of self-attention in parallel"""
 
-  def __init__(self, num_heads, head_size):
+class Head(nn.Module):
+  """ one head of self-attention"""
+  
+  def __init__(self, head_size):
     super().__init__()
-    self.heads == nn.ModuleList[Head(head_size) for _ in range(num_heads)]
-    self.proj = nn.Linear(head_size * num_heads, n_embd)
+    self.key = nn.Linear(n_embd, head_size, bias = False)
+    self. query = nn.Linear(n_embd, head_size, bias = False)
+    self.value = nn.Linear(n_embd, head_size, bias = False)
+    # buffer is value that persistent and will be saved alongside parameters
+    self.register_buffer('tril',torch.tril(torch.ones(block_size,block_size)))
+
     self.dropout = nn.Dropout(dropout)
 
-  def forward(self,x):
-    out = torch.cat
+  def forward(self, x):
+    # input of size (batch, time-step, channels)
+    # output of size (batch, time-step, head size)
+    B,T,C = x.shape
+    k = self.key(x) # (B, T, hs)
+    q = self.query(x)  # (B, T, hs)
+    # compute "affinities"
+    wei = q @ k.transpose(-2, -1)*k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+    wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+    wei = self.dropout(wei)
+    v = self.value(x) # (B, T, hs)
+    out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
+    return out
+
+    #perform the weighted aggregation of the values
+
+class FeedForward(nn.Module):
+  """ MLP Layer"""
+  def __init__(self,n_embd):
+    super().__init__()
+    self.net = nn.Sequential(
+      nn.Linear(n_embd, 4*n_embd),
+      nn.ReLU(),
+      nn.Linear(4*n_embd, n_embd),
+      nn.Dropout(dropout)
+    )
+
+  def forward(self, x):
+    return self.net(x)
+
+  
 class BigramLanguageModel(nn.Module):
-  """simple next token generation model"""
   def __init__(self):
     super().__init__()
+    # each token directly reads off the logits for the next token from a lookup table
     self.token_embedding_table = nn.Embedding(vocab_size,n_embd)
-    self.position_embedding_table = nn.Embedding(block_size,n_embd)
-    self.blocks = nn.Sequential(
-      Block(n_embd, n_head=4),
-      Block(n_embd, n_head =4),
-      Block(n_embd, n_head=4),
-      nn.LayerNorm
-    )
-    self.lm_head = nn.Linear(n_embd, vocab_size)
+
 
   def forward(self,idx, targets=None):
-    B,T = idx.shape
-
-    tok_emb = self.token_embedding_tale(idx)#(B,T,C)
-    pos_emb = self.position_embedding_table(torch.arrange(T))
-    x = tok_emb + pos_emb # (B,T.C)
-    x = self.blocks(x) # (B,T.C)
 
     logits = self.token_embedding_table(tok_emb) #(B,T,vocab_size)
     if targets is None:
@@ -103,7 +124,9 @@ class BigramLanguageModel(nn.Module):
 
   def generate(self, idx, max_new_tokens):
     for _ in range(max_new_tokens):
-      logits, loss = self(idx)
+      # crop idx to the last block_size tokens
+      idx_cond = idx[:, -block_size: ]
+      logits, loss = self(idx_cond)
       # the last token in that concepts
       logits = logits[:, -1, :] # becomes(B,C)
 
@@ -114,56 +137,26 @@ class BigramLanguageModel(nn.Module):
       idx = torch.cat((idx, idx_next), dim = 1) # (B, T+1)
     return idx
 
-class FeedForward:
-  """ MLP Layer"""
-  def __init__(self,n_embd):
-    super().__init__()
-    self.net = nn.Sequential(
-      nn.Linear(n_embd, 4*n_embd),
-      nn.ReLU,
-      nn.Linear(4*n_embd, n_embd),
-    )
+model = BigramLanguageModel(vocab_size)
+m = model.to(device)
 
-  def forward(self, x):
-    return self.net(x)
+# Use pytorch optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr = learning_rate)
 
-
-class Block(nn.Module):
-
-  def __init__(self, n_embd, n_head):
-
-    super().__init__()
-    head_size = n_embd // n_head
-    self.sa = MultiHeadAttention(n_head, head_size)
-    self.ffwd = FeedForward(n_embd)
-    self.ln1 = nn.LayerNorm(n_embd)
-    self.ln2 = nn.LayerNorm(n_embd)
-
-
-  def forward(self,x):
-    x += self.sa(x)
-    x += self.ffwd(x)
-    return x
-
-
-
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
-# lr is the usual learning rate
-
-"""### Training Loop"""
-
-batch_size = 32
-for steps in range(100): # increase number of steps for good results...
-
-    # sample a batch of data
+for iter in range(max_iters):
+  # So every once in a while we evaluate the loss on train and val sets
+  if iter % eval_interval == 0 or iter == max_iters -1:
+    losses = estimate_loss()
+    print(f"step (iter): train loss {losses['train']:.4f}, val loss{losses['val']:.4f}")
+    # This is for sampling a batch of data
     xb, yb = get_batch('train')
-
     # evaluate the loss
-    logits, loss = m(xb, yb)
+    logits, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
-
+# generate context from the model
+context = torch.zeros((1,1),dtype = torch.long)
+print(decode(m.generate(context, max_new_tokens = 500)[0].tolist()))
 
